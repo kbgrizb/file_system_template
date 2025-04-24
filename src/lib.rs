@@ -179,7 +179,7 @@ impl<
     pub fn save_file_bytes(&mut self, inode: &Inode<MAX_FILE_BLOCKS, BLOCK_SIZE>) {
        // todo!("Write the file pointed to by inode from the file content buffer onto the disk.");
         // For each inode block in use
-        for i in 0..inode.blocks.len() {
+        for i in 0..inode.blocks_used() {
             for j in 0..BLOCK_SIZE {
                 self.block_buffer[j] = self.file_content_buffer[(i * BLOCK_SIZE) + j];
                 self.disk.write(inode.blocks[i].into(), &self.block_buffer).unwrap();
@@ -417,7 +417,7 @@ impl<
     ) -> anyhow::Result<(usize, Inode<MAX_FILE_BLOCKS, BLOCK_SIZE>), FileSystemError> {
        // todo!("Search the directory for the inode number that matches the filename");
         // Call `load_directory()` to load the directory into the file content buffer.
-        self.load_directory();
+        self.load_directory()?;
  
         // For every file entry in the directory
         let filename_bytes = filename.as_bytes();
@@ -543,18 +543,24 @@ impl<
             }
         }
         // Check how much space we are currently using for the directory file.
-        let space = (inode_num + 1) * MAX_FILENAME_BYTES;
-        if space as u16 > directory_inode.bytes_stored{
+        let space = ((inode_num + 1) * MAX_FILENAME_BYTES) / BLOCK_SIZE;
+        if space as u16 > directory_inode.bytes_stored / BLOCK_SIZE as u16{
             let new_block = self.request_data_block()?;
-            directory_inode.blocks = [new_block; MAX_FILE_BLOCKS];
-        }
+            let block_index = directory_inode.blocks_used();
+            if block_index >= MAX_FILE_BLOCKS {
+                return Err(FileSystemError::DiskFull);
+            }
  
-        // * If we need more space, call `request_data_block()` to get another block.
-        // * Update the directory's inode accordingly.
-        // Call `save_file_bytes()` to save the updated directory file.
+            directory_inode.blocks[block_index] = new_block;
+ 
+        }
+       
+        directory_inode.bytes_stored = ((inode_num + 1) * MAX_FILENAME_BYTES) as u16;
+ 
         self.save_file_bytes(directory_inode);
-        // Call `save_inode()` to save the updated directory inode.
-        self.save_inode(inode_num+1, directory_inode);
+ 
+        self.save_inode(0, directory_inode);
+ 
         Ok(())
     }
 
@@ -578,31 +584,101 @@ impl<
     }
 
     pub fn read(&mut self, fd: usize, buffer: &mut [u8]) -> anyhow::Result<usize, FileSystemError> {
-        todo!("Read from `fd` until `buffer` is full or there is no data left.");
+        //todo!("Read from `fd` until `buffer` is full or there is no data left.");
         // Use the `open` table entry to determine how much of the file we have read.
+        let entry = self.open[fd].as_mut().ok_or(FileSystemError::FileNotOpen)?;
+        if entry.writing {
+            return Err(FileSystemError::NotOpenForRead);
+        }
+        else if entry.inode.bytes_stored == 0 {
+            return Ok(0);
+        }       
         // * If it isn't open, return FileNotOpen.
         // * If it's open to write, return NotOpenForRead.
         // * If there isn't anything left to read, return 0.
         // Calculate the number of bytes you can read, based on the number left to read and the buffer size.
+        let bytes_left = entry.inode.bytes_stored as usize - entry.offset;
+        if bytes_left == 0 {
+            return Ok(0);
+        }
         // Load each block from disk as you need them into the block buffer of the `FileInfo` object for this file.
         // Copy each byte into `buffer` from the block buffer.
+        let mut bytes_read = 0;
+        while bytes_read < buffer.len() && bytes_read < bytes_left {
+            if entry.offset % BLOCK_SIZE == 0 {
+                if entry.current_block >= entry.inode.blocks_used() {
+                    break;
+                }
+                // Load the next block from disk into the block buffer.
+                let block_num = entry.inode.blocks[entry.current_block];
+                self.disk.read(block_num.into(), &mut entry.block_buffer).unwrap();
+                entry.current_block += 1;
+            }
+            let block_offset = entry.offset % BLOCK_SIZE;
+            let bytes_to_copy = min(
+                min(buffer.len() - bytes_read, BLOCK_SIZE - block_offset),
+                bytes_left - bytes_read,
+            );
+            buffer[bytes_read..bytes_read + bytes_to_copy]
+                .copy_from_slice(&entry.block_buffer[block_offset..block_offset + bytes_to_copy]);
+            bytes_read += bytes_to_copy;
+            entry.offset += bytes_to_copy;
+        }
+        // If the block buffer is empty, read the next block from disk into it.
+
         // Update your FileInfo object as needed.
         // Return the total number of bytes read when finished.
+        return Ok(bytes_read);
     }
 
     pub fn write(&mut self, fd: usize, buffer: &[u8]) -> anyhow::Result<(), FileSystemError> {
-        todo!("Write to `fd` until `buffer` is empty.");
+        //todo!("Write to `fd` until `buffer` is empty.");
         // Examine the FileInfo object from `open` for this file.
-        // * If it doesn't have an entry, return FileNotOpen.
-        // * If not open for writing, return NotOpenForWrite.
-        // Copy each byte from `buffer` into the FileInfo object's block buffer.
-        // * If the block buffer fills up before `buffer` is empty:
-        //   * Write the current block buffer contents to disk.
-        //     * If the file exceeds the maximum size, return FileTooBig.
-        //   * Request a new data block.
-        //   * Be sure to update your inode!
-        // * When finished, make sure to write the current block to disk.
+        match self.open[fd] {
+            // * If it doesn't have an entry, return FileNotOpen.
+            None => return Err(FileSystemError::FileNotOpen),
+            // * If not open for writing, return NotOpenForWrite.
+            Some(mut file_info) => {
+                if !file_info.writing {
+                    return Err(FileSystemError::NotOpenForWrite);
+                }
+
+                // Copy each byte from `buffer` into the FileInfo object's block buffer.
+                for i in 0..buffer.len(){
+                    file_info.block_buffer[file_info.offset] = buffer[i];
+                    file_info.offset += 1;
+                    file_info.inode.bytes_stored += 1;
+
+                    // * If the block buffer fills up before `buffer` is empty:
+                    if file_info.offset == file_info.block_buffer.len(){
+
+                        //   * Write the current block buffer contents to disk.
+                        self.disk.write(file_info.inode.blocks[file_info.current_block].into(), &file_info.block_buffer);
+
+                        self.save_inode(file_info.inode_num, &file_info.inode);
+                        //     * If the file exceeds the maximum size, return FileTooBig.
+                        if file_info.inode_num + self.block_buffer.len() > MAX_FILE_BYTES{
+                            return Err(FileSystemError::FileTooBig(file_info.inode_num))
+                        }
+                        //   * Request a new data block.
+                        //   * Be sure to update your inode!
+                        let new_block = self.request_data_block()?;
+                        file_info.inode.blocks[file_info.current_block + 1] = new_block;
+                        file_info.current_block += 1;
+                        self.save_inode(file_info.inode_num, &file_info.inode);
+                        file_info.offset = 0;
+                    }
+                    
+                }
+                        // * When finished, make sure to write the current block to disk.
+                self.disk.write(file_info.inode.blocks[file_info.current_block] as usize, &file_info.block_buffer).unwrap();
+                self.save_inode(file_info.inode_num, &file_info.inode);
+                self.open[fd] = Some(file_info);
+                Ok(())
+            }
+        }
     }
+        
 
     //----------
 
